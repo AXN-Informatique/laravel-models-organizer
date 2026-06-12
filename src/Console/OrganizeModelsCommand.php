@@ -1,6 +1,6 @@
 <?php
 
-namespace Axn\ModelsOrganizer;
+namespace Axn\ModelsOrganizer\Console;
 
 use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Attributes\Scope as ScopeAttribute;

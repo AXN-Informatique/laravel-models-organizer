@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Axn\ModelsOrganizer;
 
-use Axn\ModelsOrganizer\OrganizeModelsCommand;
+use Axn\ModelsOrganizer\Console\OrganizeModelsCommand;
 use Illuminate\Support\ServiceProvider as BaseServiceProvider;
 
 class ServiceProvider extends BaseServiceProvider

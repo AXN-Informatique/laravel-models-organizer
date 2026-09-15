@@ -134,6 +134,31 @@ use Axn\Multilingual\Models\Language as BaseModel;
 
 Les classes situées dans le même namespace que la méthode source sont également ajoutées automatiquement au trait généré si nécessaire.
 
+## Configuration
+
+La configuration peut être publiée via `vendor:publish` (uniquement disponible en environnement local) :
+
+```bash
+php artisan vendor:publish --tag=models-organizer-config
+```
+
+Cela crée le fichier `config/models-organizer.php` dans l'application cible.
+
+### `ignored_traits`
+
+Liste des traits (noms de classe complets, FQCN) à exclure totalement de l'analyse, par exemple :
+
+```php
+'ignored_traits' => [
+    \App\Models\Concerns\HasUuid::class,
+],
+```
+
+Un trait listé ici, ainsi que tous les traits qu'il utilise lui-même, ne sera pas parcouru : ses méthodes ne seront donc jamais déplacées vers `Relations.php`, `Scopes.php` ou `Attributes.php`, et il ne sera jamais supprimé même s'il devient vide ou inutilisé.
+
+Utile pour préserver des traits « métier » (ex. `HasUuid`, `Auditable`, etc.) que l'on ne veut pas voir réorganisés par la commande.
+
+
 ## Exemple
 
 Avant :

@@ -28,6 +28,8 @@ class ServiceProvider extends BaseServiceProvider
             $this->commands([
                 OrganizeModelsCommand::class,
             ]);
+
+            $this->configurePublishing();
         }
     }
 
@@ -37,5 +39,13 @@ class ServiceProvider extends BaseServiceProvider
             $this->basePath.'config/models-organizer.php',
             'models-organizer'
         );
+    }
+
+    private function configurePublishing(): void
+    {
+        // config
+        $this->publishes([
+            $this->basePath.'config/models-organizer.php' => $this->app->configPath('models-organizer.php'),
+        ], 'models-organizer-config');
     }
 }

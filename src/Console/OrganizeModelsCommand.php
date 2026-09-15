@@ -40,12 +40,15 @@ class OrganizeModelsCommand extends Command
 
     private NodeFinder $finder;
 
+    private array $ignoredTraits = [];
+
     public function handle(): int
     {
         $this->removeUnusedTraitsInModelsDirectory();
 
         $this->parser = new ParserFactory()->createForNewestSupportedVersion();
         $this->finder = new NodeFinder();
+        $this->ignoredTraits = config('models-organizer.ignored_traits', []);
 
         $models = $this->argument('model')
             ? [$this->argument('model')]
@@ -405,6 +408,10 @@ class OrganizeModelsCommand extends Command
         $traitName = $trait->getName();
 
         if (isset($visitedTraits[$traitName])) {
+            return;
+        }
+
+        if (in_array($traitName, $this->ignoredTraits)) {
             return;
         }
 

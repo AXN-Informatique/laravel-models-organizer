@@ -3,7 +3,6 @@
     "description": "Organize Laravel models concerns (relations, scopes, attributes) in dedicated traits.",
     "homepage": "https://github.com/AXN-Informatique/laravel-models-organizer",
     "support": {
-        "issues": "https://github.com/AXN-Informatique/laravel-models-organizer/issues",
         "source": "https://github.com/AXN-Informatique/laravel-models-organizer"
     },
     "type": "library",

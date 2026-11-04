@@ -6,21 +6,28 @@ use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Attributes\Scope as ScopeAttribute;
 use Illuminate\Database\Eloquent\Casts\Attribute as EloquentAttribute;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\File;
+use PhpParser\Comment;
 use PhpParser\Error;
 use PhpParser\Node;
 use PhpParser\Node\Name;
 use PhpParser\Node\Stmt\Class_;
+use PhpParser\Node\Stmt\ClassConst;
+use PhpParser\Node\Stmt\ClassLike;
 use PhpParser\Node\Stmt\ClassMethod;
+use PhpParser\Node\Stmt\Enum_;
 use PhpParser\Node\Stmt\Namespace_;
+use PhpParser\Node\Stmt\Property;
 use PhpParser\Node\Stmt\Trait_;
 use PhpParser\Node\Stmt\TraitUse;
 use PhpParser\Node\Stmt\Use_;
 use PhpParser\NodeFinder;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitor\NameResolver;
 use PhpParser\ParserFactory;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
+use ReflectionAttribute;
 use ReflectionClass;
 use ReflectionMethod;
 use ReflectionNamedType;
@@ -42,33 +49,75 @@ class OrganizeModelsCommand extends Command
 
     private array $ignoredTraits = [];
 
+    /**
+     * Classes, enums et traits de app/ relevés par analyse statique.
+     *
+     * @var array<string, array{file: string, isTrait: bool, traits: list<string>}>
+     */
+    private array $classLikes = [];
+
+    /**
+     * Traits que la commande ne parcourt ni ne modifie, avec la raison
+     * affichée quand un modèle les utilise (null : aucun message).
+     *
+     * @var array<string, string|null>
+     */
+    private array $protectedTraits = [];
+
+    /**
+     * Contenu des fichiers lus, tel qu'au lancement de la commande : toute
+     * l'analyse s'appuie dessus, même quand un fichier partagé par plusieurs
+     * modèles a été réécrit ou supprimé entre-temps.
+     *
+     * @var array<string, string>
+     */
+    private array $originalContents = [];
+
+    /**
+     * @var array<string, array<int, Node>>
+     */
+    private array $parsedFiles = [];
+
+    /**
+     * Fichiers écrits et supprimés, y compris en simulation.
+     *
+     * @var array<string, true>
+     */
+    private array $writtenFiles = [];
+
+    /**
+     * @var array<string, true>
+     */
+    private array $deletedFiles = [];
+
     public function handle(): int
     {
+        $this->parser = new ParserFactory()->createForNewestSupportedVersion();
+        $this->finder = new NodeFinder;
+        $this->ignoredTraits = array_map(
+            fn (string $traitClass): string => ltrim($traitClass, '\\'),
+            config('models-organizer.ignored_traits', []),
+        );
+
+        try {
+            $this->classLikes = $this->discoverClassLikesInApplication();
+        } catch (RuntimeException $runtimeException) {
+            $this->error($runtimeException->getMessage());
+
+            return self::FAILURE;
+        }
+
+        $models = collect($this->argument('model') ? [ltrim((string) $this->argument('model'), '\\')] : $this->discoverModels())
+            ->filter(fn (string $modelClass): bool => class_exists($modelClass) && is_subclass_of($modelClass, Model::class))
+            ->values()
+            ->all();
+
         $this->removeUnusedTraitsInModelsDirectory();
 
-        $this->parser = new ParserFactory()->createForNewestSupportedVersion();
-        $this->finder = new NodeFinder();
-        $this->ignoredTraits = config('models-organizer.ignored_traits', []);
+        $this->protectTraits($this->traitsUsedByClassesOtherThan($models), 'Trait non traité car utilisé hors des modèles traités');
+        $this->protectTraits($this->ignoredTraits, null);
 
-        $models = $this->argument('model')
-            ? [$this->argument('model')]
-            : $this->discoverModels();
-
-        foreach ($models as $modelClass) {
-            if (! class_exists($modelClass)) {
-                continue;
-            }
-
-            if (! is_subclass_of($modelClass, Model::class)) {
-                continue;
-            }
-
-            try {
-                $this->organizeModel($modelClass);
-            } catch (Throwable $e) {
-                $this->error('  '.$e->getMessage());
-            }
-        }
+        $this->applyPlans($this->analyzeModels($models));
 
         $this->removeEmptyDirectories(app_path('Models'));
 
@@ -77,119 +126,161 @@ class OrganizeModelsCommand extends Command
         return self::SUCCESS;
     }
 
-    private function removeUnusedTraitsInModelsDirectory(): void
+    /**
+     * Relève chaque classe, enum et trait de app/ avec les traits qu'il
+     * utilise, par analyse statique : aucune classe n'est chargée.
+     *
+     * @return array<string, array{file: string, isTrait: bool, traits: list<string>}>
+     */
+    private function discoverClassLikesInApplication(): array
     {
-        $traits = $this->discoverApplicationTraitsInModelsDirectory();
-
-        if ($traits === []) {
-            return;
-        }
-
-        $usedTraits = $this->discoverUsedTraitsByModels();
-
-        foreach ($traits as $traitClass => $traitFile) {
-            if (isset($usedTraits[$traitClass])) {
-                continue;
-            }
-
-            $this->deleteUnusedTraitFile($traitFile);
-        }
-    }
-
-    private function discoverApplicationTraitsInModelsDirectory(): array
-    {
-        $basePath = app_path('Models');
-
-        if (! File::isDirectory($basePath)) {
+        if (! File::isDirectory(app_path())) {
             return [];
         }
 
+        $classLikes = [];
+
+        foreach (File::allFiles(app_path()) as $file) {
+            if ($file->getExtension() !== 'php') {
+                continue;
+            }
+
+            $path = $file->getPathname();
+
+            $nodes = $this->finder->find(
+                $this->parseFile($path),
+                fn (Node $node): bool => $node instanceof Class_ || $node instanceof Trait_ || $node instanceof Enum_,
+            );
+
+            foreach ($nodes as $classLike) {
+                $name = $classLike->namespacedName?->toString() ?? $path.'@anonymous:'.$classLike->getStartLine();
+
+                $classLikes[$name] = [
+                    'file' => $path,
+                    'isTrait' => $classLike instanceof Trait_,
+                    'traits' => $this->traitsUsedByNode($classLike),
+                ];
+            }
+        }
+
+        return $classLikes;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function traitsUsedByNode(ClassLike $classLike): array
+    {
         $traits = [];
 
-        foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($basePath)) as $file) {
-            if (! $file->isFile() || $file->getExtension() !== 'php') {
+        foreach ($classLike->stmts as $stmt) {
+            if (! $stmt instanceof TraitUse) {
                 continue;
             }
 
-            $class = $this->classFromAppFilePath($file->getPathname());
-
-            if (! $class || ! trait_exists($class)) {
-                continue;
+            foreach ($stmt->traits as $trait) {
+                $traits[] = $trait->toString();
             }
-
-            if ($this->isVendorFile($file->getPathname())) {
-                continue;
-            }
-
-            $traits[$class] = $file->getPathname();
         }
 
         return $traits;
     }
 
-    private function discoverUsedTraitsByModels(): array
+    /**
+     * Les traits donnés et, récursivement, ceux qu'ils utilisent.
+     *
+     * @param  list<string>  $traitClasses
+     * @return array<string, true>
+     */
+    private function reachableTraits(array $traitClasses): array
     {
-        $usedTraits = [];
+        $reachable = [];
 
-        foreach ($this->discoverModels() as $modelClass) {
-            if (! class_exists($modelClass) || ! is_subclass_of($modelClass, Model::class)) {
+        while ($traitClasses !== []) {
+            $traitClass = array_pop($traitClasses);
+
+            if (isset($reachable[$traitClass])) {
                 continue;
             }
 
-            $reflection = new ReflectionClass($modelClass);
+            $reachable[$traitClass] = true;
 
-            foreach ($this->allTraitsUsedByReflection($reflection) as $traitClass) {
-                $usedTraits[$traitClass] = true;
-            }
+            array_push($traitClasses, ...($this->classLikes[$traitClass]['traits'] ?? []));
         }
 
-        return $usedTraits;
+        return $reachable;
     }
 
-    private function allTraitsUsedByReflection(ReflectionClass $reflection): array
+    /**
+     * Traits utilisés directement par les classes et enums de app/ autres
+     * que les modèles donnés.
+     *
+     * @param  list<string>  $models
+     * @return list<string>
+     */
+    private function traitsUsedByClassesOtherThan(array $models): array
     {
-        $traits = [];
+        return collect($this->classLikes)
+            ->reject(fn (array $classLike, string $name): bool => $classLike['isTrait'] || \in_array($name, $models, true))
+            ->flatMap(fn (array $classLike): array => $classLike['traits'])
+            ->unique()
+            ->values()
+            ->all();
+    }
 
-        foreach ($reflection->getTraits() as $trait) {
-            $traitClass = $trait->getName();
+    /**
+     * Protège les traits donnés et ceux qu'ils utilisent ; une protection
+     * déjà posée garde sa raison.
+     *
+     * @param  list<string>  $traitClasses
+     */
+    private function protectTraits(array $traitClasses, ?string $reason): void
+    {
+        foreach (array_keys($this->reachableTraits($traitClasses)) as $traitClass) {
+            if (! \array_key_exists($traitClass, $this->protectedTraits) || $reason === null) {
+                $this->protectedTraits[$traitClass] = $reason;
+            }
+        }
+    }
 
-            if ($this->isVendorFile($trait->getFileName())) {
+    private function removeUnusedTraitsInModelsDirectory(): void
+    {
+        $usedTraits = $this->reachableTraits([
+            ...$this->ignoredTraits,
+            ...$this->traitsUsedByClassesOtherThan([]),
+        ]);
+
+        $classLikesByFile = collect($this->classLikes)->groupBy('file', preserveKeys: true);
+
+        foreach ($classLikesByFile as $file => $classLikes) {
+            if (! $this->isInModelsDirectory($file)) {
                 continue;
             }
 
-            $traits[$traitClass] = true;
+            $onlyUnusedTraits = $classLikes->every(
+                fn (array $classLike, string $name): bool => $classLike['isTrait'] && ! isset($usedTraits[$name]),
+            );
 
-            foreach ($this->allTraitsUsedByReflection($trait) as $nestedTraitClass) {
-                $traits[$nestedTraitClass] = true;
+            if ($onlyUnusedTraits) {
+                $this->deleteUnusedTraitFile($file);
             }
         }
-
-        return array_keys($traits);
     }
 
-    private function classFromAppFilePath(string $path): ?string
+    private function isInModelsDirectory(string $path): bool
     {
         $realPath = realpath($path);
+        $modelsPath = realpath(app_path('Models'));
 
-        if ($realPath === false) {
-            return null;
-        }
-
-        $appPath = realpath(app_path());
-
-        if ($appPath === false || ! str_starts_with($realPath, $appPath.DIRECTORY_SEPARATOR)) {
-            return null;
-        }
-
-        return 'App\\'.str($realPath)
-            ->after($appPath.DIRECTORY_SEPARATOR)
-            ->beforeLast('.php')
-            ->replace(DIRECTORY_SEPARATOR, '\\')
-            ->toString();
+        return $realPath !== false
+            && $modelsPath !== false
+            && str_starts_with($realPath, $modelsPath.DIRECTORY_SEPARATOR);
     }
 
     private function deleteUnusedTraitFile(string $path): void
     {
+        $this->deletedFiles[$path] = true;
+
         if ($this->option('dry-run')) {
             $this->line('[dry-run] Trait inutilisé supprimé : '.$this->shortenPath($path));
 
@@ -239,16 +330,72 @@ class OrganizeModelsCommand extends Command
         return $models;
     }
 
-    private function organizeModel(string $modelClass): void
+    /**
+     * Analyse tous les modèles avant la moindre écriture. Un modèle en erreur
+     * n'est pas modifié, et ses traits sont protégés : l'analyse reprend sans
+     * eux, puisque d'autres modèles peuvent les partager.
+     *
+     * @param  list<string>  $models
+     * @return array<string, array<string, mixed>>
+     */
+    private function analyzeModels(array $models): array
+    {
+        $errors = [];
+
+        do {
+            $plans = [];
+            $failedModel = null;
+
+            foreach ($models as $modelClass) {
+                if (isset($errors[$modelClass])) {
+                    $plans[$modelClass] = ['error' => $errors[$modelClass]];
+
+                    continue;
+                }
+
+                try {
+                    $plans[$modelClass] = $this->analyzeModel($modelClass);
+                } catch (Throwable $e) {
+                    $errors[$modelClass] = $e->getMessage();
+                    $failedModel = $modelClass;
+
+                    break;
+                }
+            }
+
+            if ($failedModel !== null) {
+                $this->protectTraits(
+                    $this->classLikes[$failedModel]['traits'] ?? [],
+                    'Trait non traité car partagé avec un modèle en erreur',
+                );
+            }
+        } while ($failedModel !== null);
+
+        return $plans;
+    }
+
+    /**
+     * Ce que la commande fera pour un modèle : traits à générer, lignes à
+     * retirer des fichiers sources, traits sources à réexaminer.
+     *
+     * @return array<string, mixed>
+     */
+    private function analyzeModel(string $modelClass): array
     {
         $reflection = new ReflectionClass($modelClass);
         $modelFile = $reflection->getFileName();
 
-        if (! $modelFile) {
-            return;
-        }
+        $plan = [
+            'modelFile' => $modelFile ?: null,
+            'generatedTraits' => [],
+            'removals' => [],
+            'traitFiles' => [],
+            'notices' => [],
+        ];
 
-        $this->info($modelClass);
+        if (! $modelFile) {
+            return $plan;
+        }
 
         $this->ensureModelUsedTraitsExist($modelFile);
 
@@ -269,7 +416,6 @@ class OrganizeModelsCommand extends Command
 
         $concernBase = $this->concernBaseForModel($modelClass);
         $concernNamespace = $this->concernNamespaceForModel($modelClass);
-        $generatedTraits = [];
 
         foreach (['Relations', 'Scopes', 'Attributes'] as $traitName) {
             $traitPath = $concernBase.DIRECTORY_SEPARATOR.$traitName.'.php';
@@ -284,28 +430,40 @@ class OrganizeModelsCommand extends Command
                 continue;
             }
 
-            $this->writeConcernTrait($traitPath, $concernNamespace, $traitName, $traitMethods);
-
-            $generatedTraits[$traitPath] = $traitClass;
+            $plan['generatedTraits'][$traitPath] = [
+                'class' => $traitClass,
+                'content' => $this->buildConcernTrait($concernNamespace, $traitName, $traitMethods),
+            ];
         }
 
-        $emptyTraitFilesToDelete = $this->detectEmptyUsedTraitFiles($reflection);
+        $generatedClasses = array_column($plan['generatedTraits'], 'class');
 
-        if ($generatedTraits === [] && $emptyTraitFilesToDelete === []) {
-            return;
+        foreach ($removableMethods as $method) {
+            if (\in_array($method['sourceClass'], $generatedClasses, true)) {
+                continue;
+            }
+
+            $range = $this->getMethodRangeIncludingDocAndAttributes($method['method']);
+
+            if ($range === null) {
+                throw new RuntimeException('Emplacement introuvable pour la méthode '.$method['sourceClass'].'::'.$method['methodName']);
+            }
+
+            $plan['removals'][$method['sourceFile']][$range['start']] = $range['end'];
         }
 
-        $this->rewriteSourceFiles(
-            modelFile: $modelFile,
-            generatedTraits: $generatedTraits,
-            movedMethods: $removableMethods,
-            emptyTraitFilesToDelete: $emptyTraitFilesToDelete,
+        $plan['traitFiles'] = $this->collectModelTraitFiles(
+            modelReflection: $reflection,
+            generatedTraitFiles: array_keys($plan['generatedTraits']),
+            notices: $plan['notices'],
         );
+
+        return $plan;
     }
 
     private function ensureModelUsedTraitsExist(string $modelFile): void
     {
-        $code = File::get($modelFile);
+        $code = $this->originalContent($modelFile);
 
         try {
             $ast = $this->parser->parse($code);
@@ -411,7 +569,7 @@ class OrganizeModelsCommand extends Command
             return;
         }
 
-        if (in_array($traitName, $this->ignoredTraits)) {
+        if (\array_key_exists($traitName, $this->protectedTraits)) {
             return;
         }
 
@@ -499,6 +657,56 @@ class OrganizeModelsCommand extends Command
         }
     }
 
+    /**
+     * Fichiers des traits du modèle que la commande peut réécrire ou
+     * supprimer : ni vendor, ni protégés, ni générés par la commande.
+     *
+     * @param  list<string>  $generatedTraitFiles
+     * @param  list<string>  $notices
+     * @return array<string, string>
+     */
+    private function collectModelTraitFiles(
+        ReflectionClass $modelReflection,
+        array $generatedTraitFiles,
+        array &$notices,
+    ): array {
+        $traitFiles = [];
+        $visitedTraits = [];
+        $pendingTraits = array_values($modelReflection->getTraits());
+
+        while ($pendingTraits !== []) {
+            $trait = array_shift($pendingTraits);
+            $traitName = $trait->getName();
+
+            if (isset($visitedTraits[$traitName])) {
+                continue;
+            }
+
+            $visitedTraits[$traitName] = true;
+            $traitFile = $trait->getFileName();
+
+            if ($this->isVendorFile($traitFile)) {
+                continue;
+            }
+
+            if (\array_key_exists($traitName, $this->protectedTraits)) {
+                if ($this->protectedTraits[$traitName] !== null) {
+                    $notices[] = $this->protectedTraits[$traitName].' : '.$this->shortenPath($traitFile);
+                }
+
+                continue;
+            }
+
+            if (! \in_array($traitFile, $generatedTraitFiles, true)) {
+                $traitFiles[$traitFile] = $traitName;
+            }
+
+            array_push($pendingTraits, ...array_values($trait->getTraits()));
+        }
+
+        return $traitFiles;
+    }
+
     private function methodType(ReflectionMethod $method): string
     {
         if ($this->methodIsScope($method)) {
@@ -522,7 +730,7 @@ class OrganizeModelsCommand extends Command
             return true;
         }
 
-        return array_any($method->getAttributes(), fn ($attribute): bool => $attribute->getName() === ScopeAttribute::class);
+        return array_any($method->getAttributes(), fn (ReflectionAttribute $attribute): bool => $attribute->getName() === ScopeAttribute::class);
     }
 
     private function methodIsAttribute(ReflectionMethod $method): bool
@@ -570,7 +778,7 @@ class OrganizeModelsCommand extends Command
     {
         $file = $method->getFileName();
 
-        if ($file === false || ! File::exists($file)) {
+        if ($file === false) {
             return null;
         }
 
@@ -581,13 +789,7 @@ class OrganizeModelsCommand extends Command
             return null;
         }
 
-        $lines = file($file, FILE_IGNORE_NEW_LINES);
-
-        if ($lines === false) {
-            return null;
-        }
-
-        $lines = array_map(trim(...), \array_slice($lines, $start - 1, $end - $start + 1));
+        $lines = array_map(trim(...), \array_slice($this->originalLines($file), $start - 1, $end - $start + 1));
         $lines = array_filter($lines, fn (string $line): bool => ! preg_match('`^(//|/\*|\*|\*/)`', $line));
 
         return implode(' ', $lines);
@@ -601,80 +803,75 @@ class OrganizeModelsCommand extends Command
             return '';
         }
 
-        $file = $method->getFileName();
-
-        if (! $file || ! File::exists($file)) {
-            return '';
-        }
-
-        $lines = file($file, FILE_IGNORE_NEW_LINES);
-
-        if ($lines === false) {
-            return '';
-        }
-
         return implode("\n", \array_slice(
-            $lines,
+            $this->originalLines($method->getFileName()),
             $range['start'] - 1,
             $range['end'] - $range['start'] + 1,
         ));
     }
 
+    /**
+     * Lignes de la méthode, avec ses attributs et les commentaires collés
+     * au-dessus d'elle (sans ligne vide entre eux), quelle que soit leur
+     * forme : commentaire de ligne, bloc ou docblock.
+     *
+     * @return array{start: int, end: int}|null
+     */
     private function getMethodRangeIncludingDocAndAttributes(ReflectionMethod $method): ?array
     {
         $file = $method->getFileName();
 
-        if (! $file || ! File::exists($file)) {
+        if (! $file) {
             return null;
         }
 
-        $lines = file($file, FILE_IGNORE_NEW_LINES);
+        $node = $this->findMethodNode($file, $method);
 
-        if ($lines === false || $lines === []) {
+        if (! $node instanceof ClassMethod) {
             return null;
         }
 
-        $startLine = $method->getStartLine();
-        $endLine = $method->getEndLine();
+        // la ligne de départ du nœud inclut les attributs
+        $startLine = $node->getStartLine();
 
-        if ($startLine === false || $endLine === false) {
-            return null;
-        }
-
-        $lineCount = \count($lines);
-
-        if ($startLine < 1 || $endLine < $startLine || $startLine > $lineCount) {
-            return null;
-        }
-
-        $endLine = min($endLine, $lineCount);
-        $startIndex = $startLine - 1;
-
-        while ($startIndex > 0 && isset($lines[$startIndex - 1])) {
-            $previousLine = trim($lines[$startIndex - 1]);
-
-            if ($previousLine === '') {
+        foreach (array_reverse($node->getComments()) as $comment) {
+            if ($comment->getEndLine() < $startLine - 1 || ! $this->commentStartsItsLine($file, $comment)) {
                 break;
             }
 
-            if (
-                str_starts_with($previousLine, '#[')
-                || str_starts_with($previousLine, '*')
-                || str_starts_with($previousLine, '/**')
-                || str_starts_with($previousLine, '*/')
-            ) {
-                $startIndex--;
-
-                continue;
-            }
-
-            break;
+            $startLine = $comment->getStartLine();
         }
 
         return [
-            'start' => $startIndex + 1,
-            'end' => $endLine,
+            'start' => $startLine,
+            'end' => $node->getEndLine(),
         ];
+    }
+
+    private function findMethodNode(string $file, ReflectionMethod $method): ?ClassMethod
+    {
+        $node = $this->finder->findFirst(
+            $this->parseFile($file),
+            fn (Node $node): bool => $node instanceof ClassMethod
+                && strcasecmp($node->name->toString(), $method->getName()) === 0
+                && $node->getEndLine() === $method->getEndLine(),
+        );
+
+        return $node instanceof ClassMethod ? $node : null;
+    }
+
+    /**
+     * Un commentaire qui suit du code sur sa ligne (fin de la méthode
+     * précédente, par exemple) appartient à ce code.
+     */
+    private function commentStartsItsLine(string $file, Comment $comment): bool
+    {
+        $content = $this->originalContent($file);
+        $position = $comment->getStartFilePos();
+        $lineStart = strrpos(substr($content, 0, $position), "\n");
+        $lineStart = $lineStart === false ? 0 : $lineStart + 1;
+
+        return trim(substr($content, $lineStart, $position - $lineStart)) === '';
     }
 
     private function concernBaseForModel(string $modelClass): string
@@ -696,19 +893,21 @@ class OrganizeModelsCommand extends Command
         return 'App\\Models\\Concerns\\'.$relativeClass;
     }
 
-    private function writeConcernTrait(
-        string $path,
+    private function buildConcernTrait(
         string $namespace,
         string $name,
         array $methods,
-    ): void {
-        File::ensureDirectoryExists(dirname($path));
+    ): string {
+        foreach ($methods as $method) {
+            if (trim((string) $method['code']) === '') {
+                throw new RuntimeException('Code introuvable pour la méthode '.$method['sourceClass'].'::'.$method['methodName']);
+            }
+        }
 
         $uses = $this->mergeUses($methods);
 
         $body = collect($methods)
             ->map(fn (array $method): string => '    '.trim((string) $method['code']))
-            ->filter()
             ->sortKeys()
             ->implode("\n\n");
 
@@ -739,9 +938,8 @@ class OrganizeModelsCommand extends Command
         $content .= 'trait '.$name."\n";
         $content .= "{\n";
         $content .= $body."\n";
-        $content .= "}\n";
 
-        $this->writeFile($path, $content);
+        return $content."}\n";
     }
 
     private function mergeUses(array $methods): array
@@ -778,12 +976,12 @@ class OrganizeModelsCommand extends Command
 
     private function extractUsesFromFile(?string $file): array
     {
-        if (! $file || ! File::exists($file)) {
+        if (! $file) {
             return [];
         }
 
         try {
-            $ast = $this->parser->parse(File::get($file));
+            $ast = $this->parser->parse($this->originalContent($file));
         } catch (Error) {
             return [];
         }
@@ -885,107 +1083,312 @@ class OrganizeModelsCommand extends Command
         }
     }
 
-    private function rewriteSourceFiles(
-        string $modelFile,
-        array $generatedTraits,
-        array $movedMethods,
-        array $emptyTraitFilesToDelete = [],
-    ): void {
-        $methodsByFile = collect($movedMethods)
-            ->filter(fn (array $method): bool => ! empty($method['sourceFile']))
-            ->groupBy('sourceFile');
+    /**
+     * Applique les plans de tous les modèles. Les retraits de méthodes sont
+     * cumulés par fichier sur son contenu d'origine : un trait partagé est
+     * vidé une seule fois, et chaque modèle en a reçu sa copie.
+     *
+     * @param  array<string, array<string, mixed>>  $plans
+     */
+    private function applyPlans(array $plans): void
+    {
+        $removals = [];
+        $traitFiles = [];
+        $owners = [];
 
-        if (! $methodsByFile->has($modelFile)) {
-            $methodsByFile->put($modelFile, collect());
-        }
+        foreach ($plans as $modelClass => $plan) {
+            if (isset($plan['error'])) {
+                continue;
+            }
 
-        $deletedTraitShortNames = [];
+            foreach ($plan['removals'] as $file => $ranges) {
+                $removals[$file] = ($removals[$file] ?? []) + $ranges;
+            }
 
-        foreach ($emptyTraitFilesToDelete as $traitFile => $traitShortName) {
-            $deletedTraitShortNames[] = $traitShortName;
-
-            if (File::exists($traitFile)) {
-                $this->deleteTraitFile($traitFile);
+            foreach ($plan['traitFiles'] as $file => $traitClass) {
+                $traitFiles[$file] = $traitClass;
+                $owners[$file] ??= $modelClass;
             }
         }
 
-        $emptyTraitFiles = array_keys($emptyTraitFilesToDelete);
+        $traitContents = [];
 
-        $files = $methodsByFile->keys()
-            ->reject(fn (string $file): bool => $file === $modelFile)
-            ->reject(fn (string $file): bool => \in_array($file, $emptyTraitFiles, true))
-            ->push($modelFile);
+        foreach (array_keys($traitFiles) as $file) {
+            $traitContents[$file] = $this->contentWithoutRanges($file, $removals[$file] ?? []);
+        }
 
-        foreach ($files as $file) {
-            if (! File::exists($file)) {
-                throw new RuntimeException('Fichier introuvable : '.$file);
+        $deletedTraits = $this->detectDeletableTraits($traitFiles, $traitContents);
+
+        foreach ($plans as $modelClass => $plan) {
+            $this->info($modelClass);
+
+            if (isset($plan['error'])) {
+                $this->error('  '.$plan['error']);
+
+                continue;
             }
 
-            $methods = $methodsByFile
-                ->get($file, collect())
-                ->reject(fn (array $method) => \in_array($method['sourceClass'], $generatedTraits, true));
-
-            $content = File::get($file);
-
-            if ($methods->isNotEmpty()) {
-                $content = $this->removeMovedMethodsFromContent($content, $methods);
+            foreach ($plan['notices'] as $notice) {
+                $this->warn('  '.$notice);
             }
 
-            if ($file !== $modelFile && ! \array_key_exists($file, $generatedTraits) && $this->fileContainsTrait($content)) {
-                if ($this->traitContentHasNoDeclaredMethods($content)) {
-                    $traitShortName = $this->extractTraitShortNameFromContent($content);
+            foreach ($plan['generatedTraits'] as $path => $generatedTrait) {
+                $this->writeFile($path, $generatedTrait['content']);
+            }
 
-                    if ($traitShortName) {
-                        $deletedTraitShortNames[] = $traitShortName;
-                    }
+            foreach ($traitFiles as $file => $traitClass) {
+                if ($owners[$file] !== $modelClass) {
+                    continue;
+                }
 
+                if (isset($deletedTraits[$traitClass])) {
                     $this->deleteTraitFile($file);
 
                     continue;
                 }
 
-                $this->warn('  Trait conservé car il contient encore des méthodes : '.$this->shortenPath($file));
+                $content = $this->removeTraitUsesFromContent($traitContents[$file], $deletedTraits);
+
+                if ($content === $this->originalContent($file)) {
+                    continue;
+                }
+
+                $this->warn('  Trait conservé car il contient encore '.$this->describeRemainingMembers($content).' : '.$this->shortenPath($file));
+
+                $this->writeFile($file, $content);
             }
 
-            if ($file === $modelFile) {
-                $content = $this->removeOldTraitUsesFromContent($content, $deletedTraitShortNames);
-                $content = $this->addUseStatementsToContent($content, $generatedTraits);
-                $content = $this->addTraitUsesInsideClassContent(
-                    content: $content,
-                    traitShortNames: array_map(
-                        class_basename(...),
-                        $generatedTraits,
-                    ),
-                );
+            if ($plan['modelFile'] === null) {
+                continue;
             }
 
-            $this->writeFile($file, $content);
+            $generatedClasses = array_column($plan['generatedTraits'], 'class');
+
+            $content = $this->contentWithoutRanges($plan['modelFile'], $removals[$plan['modelFile']] ?? []);
+            $content = $this->removeTraitUsesFromContent($content, $deletedTraits);
+            $content = $this->addUseStatementsToContent($content, $generatedClasses);
+            $content = $this->addTraitUsesInsideClassContent(
+                content: $content,
+                traitShortNames: array_map(class_basename(...), $generatedClasses),
+            );
+
+            if ($content !== $this->originalContent($plan['modelFile'])) {
+                $this->writeFile($plan['modelFile'], $content);
+            }
         }
     }
 
-    private function removeMovedMethodsFromContent(string $content, Collection $methods): string
+    /**
+     * Traits à supprimer : sans méthode, propriété ni constante, et dont les
+     * traits utilisés sont eux-mêmes supprimés.
+     *
+     * @param  array<string, string>  $traitFiles
+     * @param  array<string, string>  $traitContents
+     * @return array<string, string>
+     */
+    private function detectDeletableTraits(array $traitFiles, array $traitContents): array
     {
-        $lines = explode("\n", $content);
+        $deletedTraits = [];
 
-        $ranges = $methods
-            ->map(function (array $method): ?array {
-                /** @var ReflectionMethod $reflectionMethod */
-                $reflectionMethod = $method['method'];
+        do {
+            $changed = false;
 
-                return $this->getMethodRangeIncludingDocAndAttributes($reflectionMethod);
-            })
-            ->filter()
-            ->sortByDesc('start')
-            ->values();
+            foreach ($traitFiles as $file => $traitClass) {
+                if (isset($deletedTraits[$traitClass]) || ! $this->traitIsEmpty($traitContents[$file], $deletedTraits)) {
+                    continue;
+                }
 
-        foreach ($ranges as $range) {
-            $startIndex = $range['start'] - 1;
-            $length = $range['end'] - $range['start'] + 1;
+                $deletedTraits[$traitClass] = $file;
+                $changed = true;
+            }
+        } while ($changed);
 
-            array_splice($lines, $startIndex, $length);
+        return $deletedTraits;
+    }
+
+    /**
+     * @param  array<string, string>  $deletedTraits
+     */
+    private function traitIsEmpty(string $content, array $deletedTraits): bool
+    {
+        $trait = $this->findTraitNode($content);
+
+        if (! $trait instanceof Trait_) {
+            return false;
+        }
+
+        foreach ($trait->stmts as $stmt) {
+            if ($stmt instanceof ClassMethod || $stmt instanceof Property || $stmt instanceof ClassConst) {
+                return false;
+            }
+
+            if ($stmt instanceof TraitUse && array_any($stmt->traits, fn (Name $name): bool => ! isset($deletedTraits[$name->toString()]))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function findTraitNode(string $content): ?Trait_
+    {
+        try {
+            $ast = $this->resolveNames($this->parser->parse($content) ?? []);
+        } catch (Error) {
+            return null;
+        }
+
+        $trait = $this->finder->findFirstInstanceOf($ast, Trait_::class);
+
+        return $trait instanceof Trait_ ? $trait : null;
+    }
+
+    private function describeRemainingMembers(string $content): string
+    {
+        $trait = $this->findTraitNode($content);
+
+        if (! $trait instanceof Trait_) {
+            return 'des membres';
+        }
+
+        $methods = [];
+        $properties = [];
+        $constants = [];
+        $traits = [];
+
+        foreach ($trait->stmts as $stmt) {
+            if ($stmt instanceof ClassMethod) {
+                $methods[] = $stmt->name->toString();
+            } elseif ($stmt instanceof Property) {
+                foreach ($stmt->props as $property) {
+                    $properties[] = '$'.$property->name->toString();
+                }
+            } elseif ($stmt instanceof ClassConst) {
+                foreach ($stmt->consts as $constant) {
+                    $constants[] = $constant->name->toString();
+                }
+            } elseif ($stmt instanceof TraitUse) {
+                foreach ($stmt->traits as $name) {
+                    $traits[] = $name->getAttribute('originalName', $name)->toString();
+                }
+            }
+        }
+
+        $descriptions = array_filter([
+            $this->describeMembers('la méthode', 'les méthodes', $methods),
+            $this->describeMembers('la propriété', 'les propriétés', $properties),
+            $this->describeMembers('la constante', 'les constantes', $constants),
+            $this->describeMembers('le trait', 'les traits', $traits),
+        ]);
+
+        return $descriptions === [] ? 'des membres' : implode(', ', $descriptions);
+    }
+
+    /**
+     * @param  list<string>  $names
+     */
+    private function describeMembers(string $singular, string $plural, array $names): ?string
+    {
+        return match (\count($names)) {
+            0 => null,
+            1 => $singular.' '.$names[0],
+            default => $plural.' '.implode(', ', $names),
+        };
+    }
+
+    /**
+     * Contenu d'origine du fichier, privé des lignes données (début => fin).
+     *
+     * @param  array<int, int>  $ranges
+     */
+    private function contentWithoutRanges(string $file, array $ranges): string
+    {
+        $lines = $this->originalLines($file);
+
+        krsort($ranges);
+
+        foreach ($ranges as $start => $end) {
+            array_splice($lines, $start - 1, $end - $start + 1);
         }
 
         return implode("\n", $lines);
+    }
+
+    /**
+     * Retire les « use Trait; » des traits supprimés, quel que soit le nom
+     * sous lequel le fichier les emploie (alias compris).
+     *
+     * @param  array<string, string>  $deletedTraits
+     */
+    private function removeTraitUsesFromContent(string $content, array $deletedTraits): string
+    {
+        if ($deletedTraits === []) {
+            return $content;
+        }
+
+        try {
+            $ast = $this->resolveNames($this->parser->parse($content) ?? []);
+        } catch (Error) {
+            return $content;
+        }
+
+        $edits = [];
+
+        foreach ($this->finder->findInstanceOf($ast, TraitUse::class) as $traitUse) {
+            $keptTraits = array_values(array_filter(
+                $traitUse->traits,
+                fn (Name $name): bool => ! isset($deletedTraits[$name->toString()]),
+            ));
+
+            if (\count($keptTraits) === \count($traitUse->traits)) {
+                continue;
+            }
+
+            if ($keptTraits === []) {
+                $edits[] = $this->statementLinesRange($content, $traitUse->getStartFilePos(), $traitUse->getEndFilePos()) + ['replacement' => ''];
+
+                continue;
+            }
+
+            $edits[] = [
+                'start' => $traitUse->traits[0]->getStartFilePos(),
+                'end' => end($traitUse->traits)->getEndFilePos() + 1,
+                'replacement' => implode(', ', array_map(
+                    fn (Name $name): string => $name->getAttribute('originalName', $name)->toString(),
+                    $keptTraits,
+                )),
+            ];
+        }
+
+        usort($edits, fn (array $a, array $b): int => $b['start'] <=> $a['start']);
+
+        foreach ($edits as $edit) {
+            $content = substr_replace($content, $edit['replacement'], $edit['start'], $edit['end'] - $edit['start']);
+        }
+
+        return $content;
+    }
+
+    /**
+     * Étendue d'une instruction, étendue à ses lignes entières quand elle
+     * est seule dessus.
+     *
+     * @return array{start: int, end: int}
+     */
+    private function statementLinesRange(string $content, int $startPosition, int $endPosition): array
+    {
+        $lineStart = strrpos(substr($content, 0, $startPosition), "\n");
+        $lineStart = $lineStart === false ? 0 : $lineStart + 1;
+
+        $lineEnd = strpos($content, "\n", $endPosition);
+        $lineEnd = $lineEnd === false ? \strlen($content) : $lineEnd + 1;
+
+        $aloneOnItsLines = trim(substr($content, $lineStart, $startPosition - $lineStart)) === ''
+            && trim(substr($content, $endPosition + 1, $lineEnd - $endPosition - 1)) === '';
+
+        return $aloneOnItsLines
+            ? ['start' => $lineStart, 'end' => $lineEnd]
+            : ['start' => $startPosition, 'end' => $endPosition + 1];
     }
 
     private function addUseStatementsToContent(string $content, array $fqcnList): string
@@ -1045,110 +1448,6 @@ class OrganizeModelsCommand extends Command
         );
     }
 
-    private function removeOldTraitUsesFromContent(string $content, array $traitShortNamesToRemove): string
-    {
-        foreach (array_filter($traitShortNamesToRemove) as $traitShortName) {
-            $content = preg_replace(
-                '/^[ \t]*use[ \t]+'.preg_quote((string) $traitShortName, '/').'[ \t]*;[ \t]*\R/m',
-                '',
-                (string) $content,
-            );
-        }
-
-        return $content;
-    }
-
-    private function fileContainsTrait(string $content): bool
-    {
-        return (bool) preg_match('/\btrait\s+\w+\b/', $content);
-    }
-
-    private function extractTraitShortNameFromContent(string $content): ?string
-    {
-        if (preg_match('/\btrait\s+(\w+)\b/', $content, $matches)) {
-            return $matches[1];
-        }
-
-        return null;
-    }
-
-    private function traitContentHasNoDeclaredMethods(string $content): bool
-    {
-        try {
-            $ast = $this->parser->parse($content);
-        } catch (Error) {
-            return false;
-        }
-
-        $trait = $this->finder->findFirstInstanceOf($ast, Trait_::class);
-
-        if (! $trait instanceof Trait_) {
-            return false;
-        }
-
-        foreach ($trait->stmts as $stmt) {
-            if ($stmt instanceof ClassMethod) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private function detectEmptyUsedTraitFiles(ReflectionClass $modelReflection): array
-    {
-        $emptyTraits = [];
-        $visitedTraits = [];
-
-        foreach ($modelReflection->getTraits() as $trait) {
-            $this->detectEmptyTraitRecursive(
-                trait: $trait,
-                emptyTraits: $emptyTraits,
-                visitedTraits: $visitedTraits,
-            );
-        }
-
-        return $emptyTraits;
-    }
-
-    private function detectEmptyTraitRecursive(
-        ReflectionClass $trait,
-        array &$emptyTraits,
-        array &$visitedTraits,
-    ): void {
-        $traitName = $trait->getName();
-
-        if (isset($visitedTraits[$traitName])) {
-            return;
-        }
-
-        $visitedTraits[$traitName] = true;
-        $file = $trait->getFileName();
-
-        if ($this->isVendorFile($file)) {
-            return;
-        }
-
-        if ($file && File::exists($file)) {
-            $content = File::get($file);
-
-            if (
-                $this->fileContainsTrait($content)
-                && $this->traitContentHasNoDeclaredMethods($content)
-            ) {
-                $emptyTraits[$file] = $trait->getShortName();
-            }
-        }
-
-        foreach ($trait->getTraits() as $nestedTrait) {
-            $this->detectEmptyTraitRecursive(
-                trait: $nestedTrait,
-                emptyTraits: $emptyTraits,
-                visitedTraits: $visitedTraits,
-            );
-        }
-    }
-
     private function isVendorFile(?string $path): bool
     {
         if (! $path) {
@@ -1164,8 +1463,58 @@ class OrganizeModelsCommand extends Command
         return str_contains($realPath, DIRECTORY_SEPARATOR.'vendor'.DIRECTORY_SEPARATOR);
     }
 
+    private function originalContent(string $file): string
+    {
+        if (! isset($this->originalContents[$file])) {
+            if (! File::exists($file)) {
+                throw new RuntimeException('Fichier introuvable : '.$this->shortenPath($file));
+            }
+
+            $this->originalContents[$file] = File::get($file);
+        }
+
+        return $this->originalContents[$file];
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function originalLines(string $file): array
+    {
+        return explode("\n", $this->originalContent($file));
+    }
+
+    /**
+     * Arbre syntaxique du contenu d'origine, noms résolus.
+     *
+     * @return array<int, Node>
+     */
+    private function parseFile(string $file): array
+    {
+        if (! isset($this->parsedFiles[$file])) {
+            try {
+                $this->parsedFiles[$file] = $this->resolveNames($this->parser->parse($this->originalContent($file)) ?? []);
+            } catch (Error $error) {
+                throw new RuntimeException('Analyse impossible de '.$this->shortenPath($file).' : '.$error->getMessage(), $error->getCode(), $error);
+            }
+        }
+
+        return $this->parsedFiles[$file];
+    }
+
+    /**
+     * @param  array<int, Node>  $ast
+     * @return array<int, Node>
+     */
+    private function resolveNames(array $ast): array
+    {
+        return new NodeTraverser(new NameResolver(options: ['preserveOriginalNames' => true]))->traverse($ast);
+    }
+
     private function deleteTraitFile(string $path): void
     {
+        $this->deletedFiles[$path] = true;
+
         if ($this->option('dry-run')) {
             $this->line('  [dry-run] Supprimé : '.$this->shortenPath($path));
 
@@ -1175,6 +1524,10 @@ class OrganizeModelsCommand extends Command
         File::delete($path);
     }
 
+    /**
+     * Supprime les dossiers que l'exécution laisse vides ; en simulation,
+     * les annonce d'après les écritures et suppressions simulées.
+     */
     private function removeEmptyDirectories(string $directory): bool
     {
         if (! File::isDirectory($directory)) {
@@ -1189,8 +1542,16 @@ class OrganizeModelsCommand extends Command
             }
         }
 
-        if (File::files($directory) !== [] || File::directories($directory) !== []) {
-            $isEmpty = false;
+        foreach (File::files($directory) as $file) {
+            if (! isset($this->deletedFiles[$file->getPathname()])) {
+                $isEmpty = false;
+            }
+        }
+
+        foreach (array_keys($this->writtenFiles) as $writtenFile) {
+            if (str_starts_with($writtenFile, $directory.DIRECTORY_SEPARATOR)) {
+                $isEmpty = false;
+            }
         }
 
         if ($isEmpty && $directory !== app_path('Models')) {
@@ -1212,11 +1573,15 @@ class OrganizeModelsCommand extends Command
 
     private function writeFile(string $path, string $content): void
     {
+        $this->writtenFiles[$path] = true;
+
         if ($this->option('dry-run')) {
             $this->line('  [dry-run] Écrit : '.$this->shortenPath($path));
 
             return;
         }
+
+        File::ensureDirectoryExists(\dirname($path));
 
         File::put($path, $content);
     }

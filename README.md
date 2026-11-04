@@ -28,6 +28,10 @@ Simuler les modifications sans écrire les fichiers :
 php artisan models:organize --dry-run
 ```
 
+La simulation n’écrit rien sur le disque et annonce exactement ce que ferait l’exécution réelle : fichiers écrits, traits supprimés, dossiers vidés.
+
+La commande analyse tous les modèles avant de modifier le moindre fichier. Si un fichier PHP de `app/` ne peut pas être analysé, elle s’arrête sans rien modifier.
+
 ## Objectif
 
 La commande déplace automatiquement :
@@ -98,6 +102,18 @@ La commande analyse :
 
 Les traits vendor sont ignorés.
 
+## Commentaires et attributs
+
+Une méthode déplacée emporte ses attributs (`#[...]`, y compris sur plusieurs lignes) et les commentaires collés au-dessus d’elle, sans ligne vide entre eux, quelle que soit leur forme : docblock `/** */`, bloc `/* */` ou `//`.
+
+Un commentaire séparé de la méthode par une ligne vide (un titre de section, par exemple) reste dans le fichier d’origine.
+
+## Traits partagés
+
+Un trait utilisé par plusieurs modèles, directement ou par un trait intermédiaire, est copié dans les traits générés de chacun d’eux, puis supprimé s’il ne contient plus rien.
+
+Un trait utilisé aussi par une autre classe que les modèles traités (une classe de `app/` qui n’est pas un modèle, ou un autre modèle quand la commande vise un modèle précis) n’est ni parcouru ni modifié, pas plus que les traits qu’il utilise. La commande le signale par le message « Trait non traité car utilisé hors des modèles traités ».
+
 ## Méthodes surchargées
 
 Si une méthode est déclarée à plusieurs niveaux, seule la version finale réellement utilisée par le modèle est copiée.
@@ -112,17 +128,17 @@ Les anciennes versions surchargées sont supprimées de leurs traits sources lor
 
 ## Suppression des traits vides
 
-Lorsqu’un ancien trait ne contient plus aucune méthode après déplacement, son fichier est supprimé.
+Lorsqu’un ancien trait ne contient plus ni méthode, ni propriété, ni constante après déplacement, et que les traits qu’il utilise sont eux-mêmes supprimés, son fichier est supprimé.
 
-La directive `use AncienTrait;` est également retirée du modèle.
+La directive `use AncienTrait;` est également retirée du modèle et des traits conservés qui l’utilisaient, sous quelque nom qu’ils l’emploient (alias compris).
 
 Les dossiers vides dans `app/Models` sont supprimés automatiquement en fin de traitement.
 
 ## Suppression des traits inutilisés
 
-La commande peut également supprimer les traits présents dans `app/Models` qui ne sont plus utilisés par aucun modèle.
+La commande supprime également les traits présents dans `app/Models` que plus rien n’utilise.
 
-Attention : un trait est considéré comme inutilisé uniquement s’il n’est utilisé directement ou récursivement par aucun modèle Eloquent détecté dans `app/Models`.
+Un trait est considéré comme inutilisé s’il n’est utilisé, directement ou par un autre trait, par aucune classe ni aucun enum de `app/`, qu’il s’agisse d’un modèle ou non. La détection lit les fichiers de `app/` sans les charger. Un trait listé dans `ignored_traits`, et les traits qu’il utilise, ne sont jamais supprimés.
 
 ## Imports
 
@@ -211,12 +227,13 @@ trait Relations
 
 Une fois la commande exécutée, vérifier les messages d’informations de la commande :
 
-* Si pour un modèle est affiché le message « Trait conservé car il contient encore des méthodes », c’est peut-être parce
-que ce trait contient des relations qui n’ont pas pu être identifiées en tant que telles et qui doivent donc être déplacées
-manuellement.
+* Si pour un modèle est affiché le message « Trait conservé car il contient encore… », suivi des méthodes, propriétés,
+constantes ou traits restants, c’est peut-être parce que ce trait contient des relations qui n’ont pas pu être identifiées
+en tant que telles (par exemple une relation dérivée sans type de retour, `return $this->conditionnements()->where(...)`)
+et qui doivent donc être déplacées manuellement.
 
-* Si pour un modèle est affiché un message en rouge, c’est qu’une erreur a empêché le traitement de ce modèle. Une révision
-manuelle est alors nécessaire.
+* Si pour un modèle est affiché un message en rouge, c’est qu’une erreur a empêché le traitement de ce modèle. Ce modèle et
+ses traits restent intacts, même quand d’autres modèles partagent ces traits. Une révision manuelle est alors nécessaire.
 
 Une fois les corrections effectuées, exécutez la commande `composer dump` et corrigez l’erreur qui remonte. Il se peut
 par exemple que deux relations portant le même nom aient été rapatriées dans le trait `Relations` d’un modèle. Effectuez

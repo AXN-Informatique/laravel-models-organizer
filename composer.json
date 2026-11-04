@@ -21,12 +21,24 @@
     "require-dev": {
         "driftingly/rector-laravel": "^2.7.3",
         "laravel/pint": "^1.32.1",
+        "orchestra/testbench": "^11.3",
+        "pestphp/pest": "^5.3.5",
+        "pestphp/pest-plugin-laravel": "^5.0.1",
+        "phpunit/phpunit": "^13.4.5",
         "rector/rector": "^2.8.4"
     },
     "autoload": {
         "psr-4": {
             "Axn\\ModelsOrganizer\\": "src/"
         }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Axn\\ModelsOrganizer\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/pest"
     },
     "extra": {
         "laravel": {
@@ -38,7 +50,10 @@
     "config": {
         "optimize-autoloader": true,
         "preferred-install": "dist",
-        "sort-packages": true
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
     },
     "minimum-stability": "dev",
     "prefer-stable": true

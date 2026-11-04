@@ -19,9 +19,9 @@
         "nikic/php-parser": "^5.7"
     },
     "require-dev": {
-        "driftingly/rector-laravel": "^2.3.0",
-        "laravel/pint": "^1.29.1",
-        "rector/rector": "^2.4.2"
+        "driftingly/rector-laravel": "^2.7.3",
+        "laravel/pint": "^1.32.1",
+        "rector/rector": "^2.8.4"
     },
     "autoload": {
         "psr-4": {

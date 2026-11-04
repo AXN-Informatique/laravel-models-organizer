@@ -1,4 +1,7 @@
+/.claude
+/.mcp.json
+/.phpunit.cache
 /.rector_cache
 /vendor
-composer.lock
-/.phpunit.cache
+/composer.lock
+.vscode/settings.json

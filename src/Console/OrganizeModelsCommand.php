@@ -93,7 +93,7 @@ class OrganizeModelsCommand extends Command
     public function handle(): int
     {
         $this->parser = new ParserFactory()->createForNewestSupportedVersion();
-        $this->finder = new NodeFinder;
+        $this->finder = new NodeFinder();
         $this->ignoredTraits = array_map(
             fn (string $traitClass): string => ltrim($traitClass, '\\'),
             config('models-organizer.ignored_traits', []),

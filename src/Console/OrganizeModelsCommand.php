@@ -397,8 +397,6 @@ class OrganizeModelsCommand extends Command
             return $plan;
         }
 
-        $this->ensureModelUsedTraitsExist($modelFile);
-
         $collected = [
             'Relations' => [],
             'Scopes' => [],
@@ -459,66 +457,6 @@ class OrganizeModelsCommand extends Command
         );
 
         return $plan;
-    }
-
-    private function ensureModelUsedTraitsExist(string $modelFile): void
-    {
-        $code = $this->originalContent($modelFile);
-
-        try {
-            $ast = $this->parser->parse($code);
-        } catch (Error $error) {
-            throw new RuntimeException('Impossible de parser le code du modèle : '.$error->getMessage(), $error->getCode(), $error);
-        }
-
-        $namespaceNode = $this->finder->findFirstInstanceOf($ast, Namespace_::class);
-
-        if (! $namespaceNode instanceof Namespace_) {
-            return;
-        }
-
-        $imports = [];
-
-        foreach ($namespaceNode->stmts as $stmt) {
-            if (! $stmt instanceof Use_) {
-                continue;
-            }
-
-            foreach ($stmt->uses as $use) {
-                $shortName = $use->alias?->toString() ?? $use->name->getLast();
-                $imports[$shortName] = $use->name->toString();
-            }
-        }
-
-        $class = $this->finder->findFirstInstanceOf($ast, Class_::class);
-
-        if (! $class instanceof Class_) {
-            return;
-        }
-
-        foreach ($class->stmts as $stmt) {
-            if (! $stmt instanceof TraitUse) {
-                continue;
-            }
-
-            foreach ($stmt->traits as $traitName) {
-                $shortName = $traitName->getLast();
-
-                $fqcn = $imports[$shortName]
-                    ?? $namespaceNode->name->toString().'\\'.$shortName;
-
-                if (! trait_exists($fqcn)) {
-                    throw new RuntimeException('Trait introuvable : '.$fqcn);
-                }
-
-                $reflection = new ReflectionClass($fqcn);
-                $file = $reflection->getFileName();
-
-                if (! $file || ! File::exists($file)) {
-                    throw new RuntimeException('Fichier introuvable : '.$this->shortenPath($file));
-                }
-            }
-        }
     }
 
     private function collectFinalMethodsFromModel(

@@ -1,6 +1,13 @@
 Changelog
 =========
 
+1.2.1 (2026-11-12)
+------------------
+
+- Fix models skipped with a false "Trait introuvable" error when a trait is written as a qualified name
+- Removed the link to the GitHub issues, which are disabled, from `composer.json`
+
+
 1.2.0 (2026-11-04)
 ------------------
 
